@@ -1,0 +1,32 @@
+==================================================
+Crypto Telegram Bot - Ready for Render Deployment
+==================================================
+
+طريقة التشغيل والاستضافة:
+
+1. رفع المشروع إلى GitHub:
+   ------------------------
+   - أنشئ مستودعًا جديدًا (Repository) على GitHub وسمّه مثلاً: crypto-telegram-bot.
+   - قم بنسخ جميع الملفات (bot.py, requirements.txt, .env.example, README.txt) داخل المستودع.
+   - تأكد من عدم رفع ملف `.env` الحقيقي أو ملف `user_data.json`.
+
+2. الربط والتشغيل على منصة Render:
+   ---------------------------------
+   - قم بالتسجيل في موقع Render (https://render.com).
+   - اضغط على زر "New +" واختر "Background Worker".
+   - ربط حسابك بـ GitHub واختر مستودع `crypto-telegram-bot`.
+   - قم بضبط إعدادات الخدمة كالتالي:
+       * Name: crypto-telegram-bot
+       * Environment: Python 3
+       * Build Command: pip install -r requirements.txt
+       * Start Command: python bot.py
+   - انزل لأسفل إلى قسم "Environment Variables" وأضف المتغيرات التالية:
+       * Key: TELEGRAM_BOT_TOKEN  | Value: [ضع توكن البوت الخاص بك من BotFather]
+       * Key: GEMINI_API_KEY       | Value: [ضع مفتاح Gemini API]
+   - اضغط على "Create Background Worker".
+
+أمر التشغيل المباشر في Render (Start Command):
+python bot.py
+
+ملاحظات الأمن والسلامة:
+- جميع الصفقات منفذة تجريبيًا في النسخة الأولى ومحفوظة في ملف محلي دون التعامل مع أي منصات تداول حقيقية.
