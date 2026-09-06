@@ -165,28 +165,33 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     price = get_crypto_price(symbol)
     if not price:
-        await update.message.reply_text("❌ تعذر معرفة السعر لإتمام الصفقة.")
+      def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("خطأ: لم يتم ضبط TELEGRAM_BOT_TOKEN")
         return
 
-    total_cost = price * amount
-    data = load_data()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    if data["balance"].get("USDT", 0) < total_cost:
-        await update.message.reply_text(f"❌ الرصيد التجريبي لا يكفي. التكلفة: ${total_cost:,.2f} USDT")
-        return
+    # تسجيل الأوامر
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("price", price_command))
+    app.add_handler(CommandHandler("signal", signal_command))
+    app.add_handler(CommandHandler("balance", balance_command))
+    app.add_handler(CommandHandler("buy", buy_command))
+    app.add_handler(CommandHandler("sell", sell_command))
+    app.add_handler(CommandHandler("target", target_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("settings", settings_command))
 
-    data["balance"]["USDT"] -= total_cost
-    coin_key = symbol.upper()
-    data["balance"][coin_key] = data["balance"].get(coin_key, 0.0) + amount
-    data["orders"].append({"type": "BUY", "symbol": symbol, "amount": amount, "price": price})
-    save_data(data)
+    logger.info("تم تشغيل البوت باستمرار (Polling Mode)...")
+    app.run_polling(drop_pending_updates=True)
 
-    await update.message.reply_text(
-        f"✅ **تم تسجيل أمر شراء تجريبي بنجاح!**\n\n"
-        f"• العملة: {symbol.capitalize()}\n"
-        f"• الكمية: {amount}\n"
-        f"• بسعر: ${price:,.2f}\n"
-        f"• الإجمالي: ${total_cost:,.2f} USDT",
+
+if __name__ == "__main__":
+    main()
+t:,.2f} USDT",
         parse_mode="Markdown"
     )
 
