@@ -1,7 +1,7 @@
 import os
 import logging
-import json
-import requests
+import threading
+from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -11,6 +11,18 @@ from telegram.ext import (
 )
 import google.generativeai as genai
 
+# إعداد خادم وهمي لإبقاء Render يعمل
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "Bot is alive!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# إعداد التسجيل (Logging)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -61,6 +73,9 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("خطأ: لم يتم ضبط TELEGRAM_BOT_TOKEN")
         return
+
+    # تشغيل الخادم الوهمي في المسار الخلفي
+    threading.Thread(target=run_flask, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
