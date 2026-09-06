@@ -1,6 +1,5 @@
 python-telegram-bot
-google-generativeai
+openai
 python-dotenv
 requests
 flask
-ccxt
