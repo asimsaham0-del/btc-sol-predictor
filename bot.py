@@ -11,14 +11,12 @@ from telegram.ext import (
 )
 import google.generativeai as genai
 
-# إعداد التسجيل (Logging)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# تحميل المتغيرات
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -64,7 +62,7 @@ def main():
         logger.error("خطأ: لم يتم ضبط TELEGRAM_BOT_TOKEN")
         return
 
-app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -79,8 +77,7 @@ app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("settings", settings_command))
 
     logger.info("تم تشغيل البوت باستمرار (Polling Mode)...")
-     app.run_polling(poll_interval=3.0, drop_pending_updates=True)
-
+    app.run_polling(poll_interval=3.0, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
