@@ -35,35 +35,52 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-def get_crypto_price(symbol="BTCUSDT"):
+# جلب السعر عبر مصدر عالمي موثوق وبدون قيود على خوادم Render
+def get_crypto_price(symbol="BTC"):
     try:
-        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+        # توحيد الرمز (مثال: تحويل BTCUSDT أو btc إلى كود عملة نظيف)
+        clean_symbol = symbol.upper().replace("USDT", "").replace("USD", "")
+        
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={get_coingecko_id(clean_symbol)}&vs_currencies=usd&include_24hr_change=true"
         response = requests.get(url, timeout=10)
         data = response.json()
-        return {
-            "symbol": symbol,
-            "price": float(data["lastPrice"]),
-            "high": float(data["highPrice"]),
-            "low": float(data["lowPrice"]),
-            "change": float(data["priceChangePercent"])
-        }
-    except Exception as e:
-        logger.error(f"خطأ السعر: {e}")
+        
+        coin_id = get_coingecko_id(clean_symbol)
+        if coin_id in data:
+            price = float(data[coin_id]["usd"])
+            change = float(data[coin_id].get("usd_24h_change", 0.0))
+            return {
+                "symbol": clean_symbol + "USDT",
+                "price": price,
+                "change": change
+            }
         return None
+    except Exception as e:
+        logger.error(f"خطأ في جلب السعر: {e}")
+        return None
+
+def get_coingecko_id(symbol):
+    mapping = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+        "SOL": "solana",
+        "BNB": "binancecoin",
+        "XRP": "ripple",
+        "ADA": "cardano"
+    }
+    return mapping.get(symbol, symbol.lower())
 
 def generate_analysis(data):
     if not GEMINI_API_KEY:
-        return "خطأ: مفتاح GEMINI_API_KEY غير مضاف في Render."
+        return "خطأ: مفتاح Gemini غير مضبوط."
     
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = (
-            f"تحليل فني لعملة {data['symbol']}:\n"
-            f"السعر: {data['price']} USDT\n"
-            f"أعلى سعر: {data['high']}\n"
-            f"أدنى سعر: {data['low']}\n"
-            f"التغير: {data['change']}%\n\n"
-            f"قدم تحليلاً مختصراً جداً بدون رموز معقدة: الاتجاه، الدعم والمقاومة، والتوصية."
+            f"تحليل فني سريع لعملة {data['symbol']}:\n"
+            f"- السعر الحالي: {data['price']} USD\n"
+            f"- التغير خلال 24 ساعة: {data['change']:.2f}%\n\n"
+            f"أعطني تحليلاً مختصراً جداً يوضح الاتجاه الحالي، مناطق الدعم، ونصيحة التداول."
         )
         response = model.generate_content(prompt)
         return response.text
@@ -73,32 +90,30 @@ def generate_analysis(data):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً بك! البوت جاهز.\nارسل الآن:\n/analyze BTC\nأو\n/analyze SOL"
+        "أهلاً بك! البوت يعمل الآن بكفاءة عالية.\nجرب إرسال:\n/analyze BTC\nأو\n/analyze SOL"
     )
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = "BTCUSDT"
+    symbol = "BTC"
     if context.args:
-        user_symbol = context.args[0].upper()
-        symbol = user_symbol if user_symbol.endswith("USDT") else f"{user_symbol}USDT"
+        symbol = context.args[0].upper()
 
-    await update.message.reply_text(f"⏳ جاري تحليل {symbol}...")
+    await update.message.reply_text(f"⏳ جاري جلب السعر وتحليل {symbol}...")
     
     market_data = get_crypto_price(symbol)
     if not market_data:
-        await update.message.reply_text("تعذر جلب البيانات من Binance. تأكد من رمز العملة.")
+        await update.message.reply_text("عذراً، لم أتمكن من العثور على هذه العملة. جرب رموز مثل: BTC, ETH, SOL")
         return
 
     analysis_result = generate_analysis(market_data)
     
     message = (
-        f"📊 تحليل {symbol}\n\n"
-        f"💵 السعر الحالي: {market_data['price']} USDT\n"
-        f"📈 التغير (24h): {market_data['change']}%\n\n"
+        f"📊 تحليل {market_data['symbol']}\n\n"
+        f"💵 السعر: ${market_data['price']:,.2f}\n"
+        f"📈 التغير (24h): {market_data['change']:.2f}%\n\n"
         f"--- رأي الذكاء الاصطناعي ---\n"
         f"{analysis_result}"
     )
-    # إرسال النص بدون parse_mode لتفادي مشاكل التنسيق
     await update.message.reply_text(message)
 
 def main():
