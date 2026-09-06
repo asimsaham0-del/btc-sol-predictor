@@ -1,41 +1,41 @@
 import os
+import time
 import logging
+import threading
+from typing import Optional
+
 import requests
 from flask import Flask
-from threading import Thread
 from openai import OpenAI
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
-logger = logging.getLogger(__name__)
 
+# =========================================================
+# SETTINGS
+# =========================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN غير موجود")
+    raise ValueError("TELEGRAM_BOT_TOKEN غير موجود في Render")
 
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY غير موجود")
+    raise ValueError("OPENAI_API_KEY غير موجود في Render")
 
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+BINANCE_BASE = "https://api.binance.com"
 
-# ============================================================
 # العملات المدعومة
-# ============================================================
-
-SUPPORTED_COINS = {
+COINS = {
     "BTC": "BTCUSDT",
     "SOL": "SOLUSDT",
     "ETH": "ETHUSDT",
@@ -45,94 +45,291 @@ SUPPORTED_COINS = {
     "ADA": "ADAUSDT",
     "AVAX": "AVAXUSDT",
     "TRX": "TRXUSDT",
-    "LINK": "LINKUSDT"
+    "LINK": "LINKUSDT",
 }
 
 
-# ============================================================
-# جلب السعر من Binance
-# ============================================================
+# =========================================================
+# LOGGING
+# =========================================================
 
-def get_price(symbol):
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
-    symbol = symbol.upper()
+logger = logging.getLogger(__name__)
 
-    pair = SUPPORTED_COINS.get(symbol)
 
-    if not pair:
+# =========================================================
+# CACHE / PROTECTION
+# =========================================================
+
+cache = {}
+cache_lock = threading.Lock()
+
+# أقل مدة بين طلبات Binance
+MIN_REQUEST_INTERVAL = 2.0
+
+last_binance_request = 0.0
+
+# إذا حصل 429 نوقف الطلبات مؤقتاً
+binance_cooldown_until = 0.0
+
+
+def wait_before_request():
+    global last_binance_request
+
+    with cache_lock:
+        now = time.time()
+
+        wait = MIN_REQUEST_INTERVAL - (now - last_binance_request)
+
+        if wait > 0:
+            time.sleep(wait)
+
+        last_binance_request = time.time()
+
+
+def cache_get(key):
+    with cache_lock:
+        item = cache.get(key)
+
+        if not item:
+            return None
+
+        value, expires = item
+
+        if time.time() < expires:
+            return value
+
+        del cache[key]
+
+        return None
+
+
+def cache_set(key, value, ttl):
+    with cache_lock:
+        cache[key] = (
+            value,
+            time.time() + ttl
+        )
+
+
+# =========================================================
+# BINANCE REQUEST
+# =========================================================
+
+def binance_get(endpoint, params=None, cache_key=None, cache_ttl=15):
+
+    global binance_cooldown_until
+
+    # أولاً نحاول من الـ Cache
+    if cache_key:
+        cached = cache_get(cache_key)
+
+        if cached is not None:
+            return cached
+
+    # إذا Binance وضعنا في فترة توقف
+    if time.time() < binance_cooldown_until:
+        logger.warning("Binance cooldown active")
         return None
 
     try:
 
-        url = "https://api.binance.com/api/v3/ticker/24hr"
+        wait_before_request()
+
+        url = BINANCE_BASE + endpoint
 
         response = requests.get(
             url,
-            params={"symbol": pair},
-            timeout=10
+            params=params,
+            timeout=10,
+            headers={
+                "User-Agent": "CryptoAnalysisBot/1.0"
+            }
         )
+
+        # Rate limit
+        if response.status_code == 429:
+
+            logger.error(
+                "Binance 429 RATE LIMIT - stopping requests temporarily"
+            )
+
+            # توقف 2 دقائق
+            binance_cooldown_until = time.time() + 120
+
+            return None
+
+        # Forbidden
+        if response.status_code in (418, 403):
+
+            logger.error(
+                f"Binance access error: HTTP {response.status_code}"
+            )
+
+            # لا نعيد الطلب بسرعة
+            binance_cooldown_until = time.time() + 300
+
+            return None
 
         response.raise_for_status()
 
         data = response.json()
 
-        return {
-            "symbol": symbol,
-            "price": float(data["lastPrice"]),
-            "change": float(data["priceChangePercent"]),
-            "high": float(data["highPrice"]),
-            "low": float(data["lowPrice"]),
-            "volume": float(data["volume"])
-        }
+        if cache_key:
+            cache_set(
+                cache_key,
+                data,
+                cache_ttl
+            )
+
+        return data
+
+    except requests.exceptions.RequestException as e:
+
+        logger.error(
+            f"BINANCE REQUEST ERROR: {type(e).__name__}: {e}"
+        )
+
+        return None
 
     except Exception as e:
 
-        logger.error(f"خطأ في جلب السعر: {e}")
+        logger.error(
+            f"BINANCE UNKNOWN ERROR: {type(e).__name__}: {e}"
+        )
 
         return None
 
 
-# ============================================================
-# جلب الشموع
-# ============================================================
+# =========================================================
+# PRICE
+# =========================================================
 
-def get_klines(symbol, interval="1h", limit=100):
+def get_price(symbol):
 
-    symbol = symbol.upper()
-
-    pair = SUPPORTED_COINS.get(symbol)
+    pair = COINS.get(symbol.upper())
 
     if not pair:
         return None
 
+    data = binance_get(
+        "/api/v3/ticker/price",
+        params={
+            "symbol": pair
+        },
+        cache_key=f"price_{pair}",
+        cache_ttl=15
+    )
+
+    if not data:
+        return None
+
+    try:
+        return float(data["price"])
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# 24H DATA
+# =========================================================
+
+def get_24h(symbol):
+
+    pair = COINS.get(symbol.upper())
+
+    if not pair:
+        return None
+
+    data = binance_get(
+        "/api/v3/ticker/24hr",
+        params={
+            "symbol": pair
+        },
+        cache_key=f"24h_{pair}",
+        cache_ttl=30
+    )
+
+    if not data:
+        return None
+
     try:
 
-        url = "https://api.binance.com/api/v3/klines"
-
-        response = requests.get(
-            url,
-            params={
-                "symbol": pair,
-                "interval": interval,
-                "limit": limit
-            },
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        return response.json()
+        return {
+            "price": float(data["lastPrice"]),
+            "change": float(data["priceChangePercent"]),
+            "high": float(data["highPrice"]),
+            "low": float(data["lowPrice"]),
+            "volume": float(data["volume"]),
+        }
 
     except Exception as e:
 
-        logger.error(f"خطأ في جلب الشموع: {e}")
+        logger.error(
+            f"24H PARSE ERROR [{symbol}]: {e}"
+        )
 
         return None
 
 
-# ============================================================
-# حساب RSI
-# ============================================================
+# =========================================================
+# KLINES
+# =========================================================
+
+def get_klines(symbol, interval, limit=100):
+
+    pair = COINS.get(symbol.upper())
+
+    if not pair:
+        return None
+
+    data = binance_get(
+        "/api/v3/klines",
+        params={
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit
+        },
+        cache_key=f"klines_{pair}_{interval}_{limit}",
+        cache_ttl=60
+    )
+
+    if not data:
+        return None
+
+    try:
+
+        candles = []
+
+        for c in data:
+
+            candles.append({
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+            })
+
+        return candles
+
+    except Exception as e:
+
+        logger.error(
+            f"KLINES PARSE ERROR [{symbol} {interval}]: {e}"
+        )
+
+        return None
+
+
+# =========================================================
+# RSI
+# =========================================================
 
 def calculate_rsi(closes, period=14):
 
@@ -144,14 +341,14 @@ def calculate_rsi(closes, period=14):
 
     for i in range(1, len(closes)):
 
-        change = closes[i] - closes[i - 1]
+        difference = closes[i] - closes[i - 1]
 
-        if change >= 0:
-            gains.append(change)
+        if difference >= 0:
+            gains.append(difference)
             losses.append(0)
         else:
             gains.append(0)
-            losses.append(abs(change))
+            losses.append(abs(difference))
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -159,11 +356,13 @@ def calculate_rsi(closes, period=14):
     for i in range(period, len(gains)):
 
         avg_gain = (
-            (avg_gain * (period - 1)) + gains[i]
+            (avg_gain * (period - 1))
+            + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1)) + losses[i]
+            (avg_loss * (period - 1))
+            + losses[i]
         ) / period
 
     if avg_loss == 0:
@@ -174,82 +373,233 @@ def calculate_rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
-# ============================================================
-# تحليل بيانات السوق
-# ============================================================
+# =========================================================
+# MARKET ANALYSIS DATA
+# =========================================================
 
-def market_data(symbol):
+def analyze_market(symbol):
 
-    price_data = get_price(symbol)
-
-    if not price_data:
-        return None
-
-    kline_1h = get_klines(symbol, "1h", 100)
-    kline_4h = get_klines(symbol, "4h", 100)
-    kline_1d = get_klines(symbol, "1d", 100)
-
-    if not kline_1h or not kline_4h or not kline_1d:
-        return None
-
-    closes_1h = [float(x[4]) for x in kline_1h]
-    closes_4h = [float(x[4]) for x in kline_4h]
-    closes_1d = [float(x[4]) for x in kline_1d]
-
-    volumes_1h = [float(x[5]) for x in kline_1h]
-
-    rsi_1h = calculate_rsi(closes_1h)
-    rsi_4h = calculate_rsi(closes_4h)
-    rsi_1d = calculate_rsi(closes_1d)
-
-    support_1h = min(closes_1h[-20:])
-    resistance_1h = max(closes_1h[-20:])
-
-    support_4h = min(closes_4h[-20:])
-    resistance_4h = max(closes_4h[-20:])
-
-    average_volume = sum(volumes_1h[-20:]) / 20
-    current_volume = volumes_1h[-1]
-
-    return {
+    result = {
         "symbol": symbol,
-        "price": price_data["price"],
-        "change": price_data["change"],
-        "high": price_data["high"],
-        "low": price_data["low"],
-        "volume": price_data["volume"],
-        "rsi_1h": rsi_1h,
-        "rsi_4h": rsi_4h,
-        "rsi_1d": rsi_1d,
-        "support_1h": support_1h,
-        "resistance_1h": resistance_1h,
-        "support_4h": support_4h,
-        "resistance_4h": resistance_4h,
-        "average_volume": average_volume,
-        "current_volume": current_volume
+        "price": None,
+        "change_24h": None,
+        "high_24h": None,
+        "low_24h": None,
+        "volume": None,
+        "timeframes": {}
     }
 
+    data_24h = get_24h(symbol)
 
-# ============================================================
-# OpenAI
-# ============================================================
+    if data_24h:
 
-def ask_ai(prompt):
+        result["price"] = data_24h["price"]
+        result["change_24h"] = data_24h["change"]
+        result["high_24h"] = data_24h["high"]
+        result["low_24h"] = data_24h["low"]
+        result["volume"] = data_24h["volume"]
+
+    # الفواصل الزمنية
+    for interval in ["1h", "4h", "1d"]:
+
+        candles = get_klines(
+            symbol,
+            interval,
+            100
+        )
+
+        if not candles:
+            continue
+
+        closes = [
+            c["close"]
+            for c in candles
+        ]
+
+        highs = [
+            c["high"]
+            for c in candles
+        ]
+
+        lows = [
+            c["low"]
+            for c in candles
+        ]
+
+        volumes = [
+            c["volume"]
+            for c in candles
+        ]
+
+        rsi = calculate_rsi(closes)
+
+        support = min(lows[-30:])
+        resistance = max(highs[-30:])
+
+        avg_volume = sum(volumes[-20:]) / 20
+
+        current_volume = volumes[-1]
+
+        volume_ratio = (
+            current_volume / avg_volume
+            if avg_volume > 0
+            else 1
+        )
+
+        # الاتجاه البسيط
+        old_price = closes[-20]
+        current_price = closes[-1]
+
+        if current_price > old_price:
+            trend = "صاعد"
+        elif current_price < old_price:
+            trend = "هابط"
+        else:
+            trend = "جانبي"
+
+        result["timeframes"][interval] = {
+            "price": current_price,
+            "rsi": round(rsi, 2) if rsi is not None else None,
+            "support": support,
+            "resistance": resistance,
+            "trend": trend,
+            "volume_ratio": round(volume_ratio, 2)
+        }
+
+    return result
+
+
+# =========================================================
+# FORMAT MARKET DATA
+# =========================================================
+
+def market_text(data):
+
+    if not data:
+        return "لا توجد بيانات."
+
+    text = []
+
+    symbol = data["symbol"]
+
+    text.append(f"العملة: {symbol}")
+
+    if data["price"] is not None:
+        text.append(
+            f"السعر الحالي: {data['price']}"
+        )
+
+    if data["change_24h"] is not None:
+        text.append(
+            f"تغير 24 ساعة: {data['change_24h']:.2f}%"
+        )
+
+    for tf, info in data["timeframes"].items():
+
+        text.append(
+            f"\n{tf}:"
+        )
+
+        text.append(
+            f"الاتجاه: {info['trend']}"
+        )
+
+        if info["rsi"] is not None:
+            text.append(
+                f"RSI: {info['rsi']}"
+            )
+
+        text.append(
+            f"الدعم: {info['support']}"
+        )
+
+        text.append(
+            f"المقاومة: {info['resistance']}"
+        )
+
+        text.append(
+            f"حجم التداول مقارنة بالمتوسط: "
+            f"{info['volume_ratio']}x"
+        )
+
+    return "\n".join(text)
+
+
+# =========================================================
+# OPENAI ANALYSIS
+# =========================================================
+
+def ai_analysis(symbol, data):
+
+    raw_data = market_text(data)
+
+    prompt = f"""
+أنت محلل للعملات الرقمية.
+
+حلل {symbol} اعتماداً فقط على البيانات التالية:
+
+{raw_data}
+
+أريد تحليلاً واضحاً وقصيراً باللغة العربية.
+
+رتب النتيجة بهذا الشكل:
+
+📊 {symbol}
+
+💰 السعر الحالي:
+...
+
+📈 الاتجاه:
+صاعد / هابط / جانبي
+
+🎯 السيناريو المتوقع:
+...
+
+🟢 منطقة دخول محتملة:
+...
+
+🎯 الهدف الأول:
+...
+
+🎯 الهدف الثاني:
+...
+
+🛑 وقف الخسارة / نقطة إبطال التحليل:
+...
+
+📊 RSI:
+...
+
+🧱 الدعم:
+...
+
+🚧 المقاومة:
+...
+
+🔥 قوة الإشارة:
+من 100
+
+⚠️ المخاطر:
+...
+
+ثم أعطني القرار النهائي:
+شراء محتمل / انتظار / بيع محتمل
+
+مهم جداً:
+- لا تضمن الربح.
+- لا تدّعي معرفة المستقبل.
+- إذا كانت البيانات غير واضحة، قل "انتظار".
+- لا تنفذ أي صفقة.
+"""
 
     try:
 
         response = client.responses.create(
-
             model="gpt-5",
-
             instructions=(
-                "أنت محلل فني للعملات الرقمية. "
-                "حلل البيانات المعطاة فقط. "
-                "لا تدّعي ضمان الربح. "
-                "لا تخترع أسعاراً أو بيانات غير موجودة. "
-                "أجب باللغة العربية وبطريقة واضحة ومباشرة."
+                "أنت محلل مالي للبيانات الرقمية. "
+                "لا تنفذ صفقات ولا تقدم ضمانات ربح."
             ),
-
             input=prompt
         )
 
@@ -257,121 +607,124 @@ def ask_ai(prompt):
 
     except Exception as e:
 
-        logger.error(f"OpenAI Error: {e}")
+        logger.error(
+            f"OPENAI ERROR: {type(e).__name__}: {e}"
+        )
 
-        return "❌ حدث خطأ أثناء الاتصال بالذكاء الاصطناعي."
+        return (
+            "❌ حدث خطأ أثناء تحليل الذكاء الاصطناعي."
+        )
 
 
-# ============================================================
-# /start
-# ============================================================
+# =========================================================
+# TELEGRAM COMMANDS
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await update.message.reply_text(
+    text = """
+🤖 أهلاً بك في بوت تحليل العملات
 
-        "🚀 أهلاً بك في بوت التحليل والتداول الذكي.\n\n"
+الأوامر:
 
-        "📊 بيانات السوق: Binance\n"
-        "🤖 الذكاء الاصطناعي: OpenAI\n"
-        "📈 تحليل فني: RSI + دعم + مقاومة + حجم\n\n"
+/price BTC
+/price SOL
 
-        "الأوامر:\n\n"
+/analyze BTC
+/analyze SOL
 
-        "/price BTC\n"
-        "/analyze BTC\n"
-        "/signal\n"
-        "/balance\n"
-        "/target BTC\n"
-        "/stop BTC\n"
-        "/buy BTC\n"
-        "/sell BTC\n"
-        "/status\n"
-        "/settings\n"
-        "/help"
+/signal
 
-    )
+/help
+
+⚠️ البوت للتحليل والتوقع فقط.
+لا يقوم بتنفيذ عمليات شراء أو بيع.
+"""
+
+    await update.message.reply_text(text)
 
 
-# ============================================================
-# /status
-# ============================================================
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+📌 أوامر البوت:
 
-    await update.message.reply_text(
+💰 السعر:
+/price BTC
+/price SOL
 
-        "🟢 حالة البوت\n\n"
-        "Telegram: متصل\n"
-        "OpenAI: مفعّل\n"
-        "Binance Market Data: مفعّل\n"
-        "وضع التداول: تحليل فقط\n"
-        "تنفيذ الصفقات الحقيقية: متوقف"
+📊 التحليل:
+/analyze BTC
+/analyze SOL
 
-    )
+🔥 مقارنة BTC و SOL:
+/signal
+
+يمكنك أيضاً استخدام:
+ETH
+BNB
+XRP
+DOGE
+ADA
+AVAX
+TRX
+LINK
+"""
+
+    await update.message.reply_text(text)
 
 
-# ============================================================
-# /price
-# ============================================================
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    symbol = "BTC"
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    data = get_price(symbol)
-
-    if not data:
+    if not context.args:
 
         await update.message.reply_text(
-            f"❌ تعذر جلب سعر {symbol} من Binance."
+            "اكتب العملة مثلاً:\n/price BTC"
+        )
+
+        return
+
+    symbol = context.args[0].upper()
+
+    if symbol not in COINS:
+
+        await update.message.reply_text(
+            "❌ هذه العملة غير مدعومة."
+        )
+
+        return
+
+    price = get_price(symbol)
+
+    if price is None:
+
+        await update.message.reply_text(
+            "⚠️ تعذر جلب السعر حالياً.\n"
+            "تم إيقاف الطلبات مؤقتاً إذا كان هناك ضغط على المصدر."
         )
 
         return
 
     await update.message.reply_text(
-
-        f"💵 {symbol}/USDT\n\n"
-        f"السعر: ${data['price']:,.8f}\n"
-        f"تغير 24 ساعة: {data['change']:.2f}%\n"
-        f"أعلى سعر: ${data['high']:,.8f}\n"
-        f"أدنى سعر: ${data['low']:,.8f}"
-
+        f"💰 {symbol}\n\n"
+        f"السعر الحالي:\n"
+        f"{price:,.8f}"
     )
 
 
-# ============================================================
-# /balance
-# ============================================================
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
 
-    await update.message.reply_text(
+        await update.message.reply_text(
+            "اكتب العملة مثلاً:\n/analyze BTC"
+        )
 
-        "💰 المحفظة الافتراضية\n\n"
-        "USDT: $10.00\n"
-        "BTC: 0\n"
-        "SOL: 0\n\n"
-        "⚠️ هذه محفظة تجريبية فقط."
+        return
 
-    )
+    symbol = context.args[0].upper()
 
-
-# ============================================================
-# /analyze
-# ============================================================
-
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    symbol = "BTC"
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    if symbol not in SUPPORTED_COINS:
+    if symbol not in COINS:
 
         await update.message.reply_text(
             "❌ العملة غير مدعومة."
@@ -380,435 +733,246 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"⏳ جاري تحليل {symbol} على 1H و4H و1D..."
+        f"🔎 جاري تحليل {symbol}...\n"
+        f"انتظر قليلاً."
     )
 
-    data = market_data(symbol)
+    data = analyze_market(symbol)
 
-    if not data:
+    if not data["timeframes"]:
 
         await update.message.reply_text(
-            "❌ تعذر الحصول على بيانات السوق."
+            "❌ لم أستطع الحصول على بيانات السوق حالياً."
         )
 
         return
 
-    prompt = f"""
-
-حلل العملة {symbol} تحليلاً فنياً.
-
-بيانات السوق الحالية:
-
-السعر:
-${data['price']}
-
-تغير 24 ساعة:
-{data['change']:.2f}%
-
-أعلى 24 ساعة:
-${data['high']}
-
-أدنى 24 ساعة:
-${data['low']}
-
-RSI - ساعة:
-{data['rsi_1h']:.2f}
-
-RSI - 4 ساعات:
-{data['rsi_4h']:.2f}
-
-RSI - يوم:
-{data['rsi_1d']:.2f}
-
-دعم 1H:
-${data['support_1h']}
-
-مقاومة 1H:
-${data['resistance_1h']}
-
-دعم 4H:
-${data['support_4h']}
-
-مقاومة 4H:
-${data['resistance_4h']}
-
-حجم التداول الحالي:
-{data['current_volume']}
-
-متوسط حجم التداول:
-{data['average_volume']}
-
-أريد منك:
-
-1. الاتجاه العام.
-2. حالة RSI.
-3. أهم الدعم.
-4. أهم المقاومة.
-5. هل الدخول الآن مناسب أم الانتظار؟
-6. منطقة دخول محتملة.
-7. الهدف الأول.
-8. الهدف الثاني.
-9. وقف الخسارة.
-10. نسبة المخاطرة.
-11. درجة قوة الإشارة من 100.
-
-وفي النهاية اكتب بوضوح:
-
-🟢 دخول محتمل
-أو
-🟡 انتظار
-أو
-🔴 خروج/تجنب
-
-لا تضمن الربح.
-
-"""
-
-    result = ask_ai(prompt)
+    result = ai_analysis(
+        symbol,
+        data
+    )
 
     await update.message.reply_text(
-
-        f"📊 التحليل الفني: {symbol}\n\n"
-        f"السعر الحالي: ${data['price']:,.8f}\n\n"
-        f"{result}"
-
+        result
     )
 
 
-# ============================================================
-# /signal
-# ============================================================
-
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        "📡 أقوم بمقارنة BTC و SOL..."
+        "🔎 جاري مقارنة BTC و SOL..."
     )
 
-    btc = market_data("BTC")
-    sol = market_data("SOL")
+    btc = analyze_market("BTC")
 
-    if not btc or not sol:
+    sol = analyze_market("SOL")
+
+    if not btc["timeframes"] or not sol["timeframes"]:
 
         await update.message.reply_text(
-            "❌ تعذر الحصول على بيانات السوق."
+            "❌ تعذر الحصول على بيانات المقارنة حالياً."
         )
 
         return
 
-    prompt = f"""
+    btc_text = market_text(btc)
+    sol_text = market_text(sol)
 
-قارن بين BTC و SOL للمضاربة قصيرة المدى.
+    prompt = f"""
+قارن بين BTC و SOL بناءً على البيانات التالية:
 
 BTC:
-
-السعر:
-${btc['price']}
-
-تغير 24 ساعة:
-{btc['change']:.2f}%
-
-RSI 1H:
-{btc['rsi_1h']:.2f}
-
-RSI 4H:
-{btc['rsi_4h']:.2f}
-
-RSI 1D:
-{btc['rsi_1d']:.2f}
-
-الدعم:
-${btc['support_1h']}
-
-المقاومة:
-${btc['resistance_1h']}
-
+{btc_text}
 
 SOL:
+{sol_text}
 
-السعر:
-${sol['price']}
+أعطني نتيجة مختصرة بالعربية:
 
-تغير 24 ساعة:
-{sol['change']:.2f}%
+🥇 الأقوى حالياً:
+...
 
-RSI 1H:
-{sol['rsi_1h']:.2f}
+📈 الاتجاه:
+...
 
-RSI 4H:
-{sol['rsi_4h']:.2f}
+🎯 الأفضل للمضاربة القصيرة:
+...
 
-RSI 1D:
-{sol['rsi_1d']:.2f}
+🛑 مستوى الخطر:
+...
 
-الدعم:
-${sol['support_1h']}
+🔥 قوة الإشارة من 100:
+...
 
-المقاومة:
-${sol['resistance_1h']}
+ثم:
+شراء محتمل / انتظار
 
-حدد:
-
-1. أيهما أقوى حالياً؟
-2. أيهما أفضل للمضاربة؟
-3. منطقة الدخول.
-4. الهدف.
-5. وقف الخسارة.
-6. درجة قوة الإشارة.
-
-إذا كانت الظروف غير مناسبة قل "انتظار".
-
+لا تضمن الربح ولا تنفذ أي صفقة.
 """
 
-    result = ask_ai(prompt)
+    try:
 
-    await update.message.reply_text(
-        "📊 إشارة السوق\n\n" + result
-    )
-
-
-# ============================================================
-# /buy
-# ============================================================
-
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    symbol = "BTC"
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    await update.message.reply_text(
-
-        f"🟢 طلب شراء {symbol}\n\n"
-        "⚠️ هذا الأمر لا ينفذ شراءً حقيقياً.\n"
-        "للحصول على قرار الدخول استخدم:\n\n"
-        f"/analyze {symbol}"
-
-    )
-
-
-# ============================================================
-# /sell
-# ============================================================
-
-async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    symbol = "BTC"
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    await update.message.reply_text(
-
-        f"🔴 طلب بيع {symbol}\n\n"
-        "⚠️ هذا الأمر لا ينفذ بيعاً حقيقياً.\n"
-        "للحصول على تحليل الخروج استخدم:\n\n"
-        f"/analyze {symbol}"
-
-    )
-
-
-# ============================================================
-# /target
-# ============================================================
-
-async def target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    symbol = "BTC"
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    data = market_data(symbol)
-
-    if not data:
-
-        await update.message.reply_text(
-            "❌ تعذر الحصول على بيانات السوق."
+        response = client.responses.create(
+            model="gpt-5",
+            instructions=(
+                "حلل السوق بحذر ولا تضمن النتائج."
+            ),
+            input=prompt
         )
 
-        return
-
-    prompt = f"""
-
-العملة: {symbol}
-
-السعر الحالي:
-${data['price']}
-
-المقاومة 1H:
-${data['resistance_1h']}
-
-المقاومة 4H:
-${data['resistance_4h']}
-
-حدد هدفين محتملين للمضاربة قصيرة المدى.
-
-اذكر السعر ونسبة الارتفاع التقريبية.
-
-لا تضمن الربح.
-
-"""
-
-    result = ask_ai(prompt)
-
-    await update.message.reply_text(
-        f"🎯 أهداف {symbol}\n\n{result}"
-    )
-
-
-# ============================================================
-# /stop
-# ============================================================
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    symbol = "BTC"
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    data = market_data(symbol)
-
-    if not data:
-
         await update.message.reply_text(
-            "❌ تعذر الحصول على بيانات السوق."
+            response.output_text
         )
 
-        return
+    except Exception as e:
 
-    prompt = f"""
+        logger.error(
+            f"SIGNAL OPENAI ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
 
-العملة: {symbol}
+        await update.message.reply_text(
+            "❌ حدث خطأ أثناء إنشاء المقارنة."
+        )
 
-السعر الحالي:
-${data['price']}
 
-الدعم 1H:
-${data['support_1h']}
+# =========================================================
+# BUY / SELL
+# =========================================================
 
-الدعم 4H:
-${data['support_4h']}
-
-حدد وقف خسارة منطقي للمضاربة.
-
-اذكر المستوى وسبب اختياره.
-
-لا تضمن النتيجة.
-
-"""
-
-    result = ask_ai(prompt)
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        f"🛡️ وقف الخسارة: {symbol}\n\n{result}"
+        "ℹ️ هذا البوت لا ينفذ عمليات شراء حقيقية.\n"
+        "وظيفته تحليل السوق وإعطاء سيناريو محتمل فقط."
     )
 
 
-# ============================================================
-# /settings
-# ============================================================
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-
-        "⚙️ إعدادات البوت\n\n"
-        "🤖 AI: OpenAI\n"
-        "📡 Market Data: Binance\n"
-        "📊 Timeframes: 1H / 4H / 1D\n"
-        "📈 RSI: مفعّل\n"
-        "📊 Volume: مفعّل\n"
-        "🛡️ Stop Loss: تحليل آلي\n"
-        "💰 تنفيذ الصفقات: متوقف"
-
+        "ℹ️ هذا البوت لا ينفذ عمليات بيع حقيقية.\n"
+        "وظيفته تحليل السوق وإعطاء سيناريو محتمل فقط."
     )
 
 
-# ============================================================
-# /help
-# ============================================================
+# =========================================================
+# RENDER WEB SERVER
+# =========================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+app = Flask(__name__)
 
-    await update.message.reply_text(
 
-        "📋 أوامر البوت\n\n"
+@app.route("/")
+def home():
 
-        "/start\n"
-        "/status\n"
-        "/price BTC\n"
-        "/balance\n"
-        "/signal\n"
-        "/analyze BTC\n"
-        "/analyze SOL\n"
-        "/buy BTC\n"
-        "/sell BTC\n"
-        "/target BTC\n"
-        "/stop BTC\n"
-        "/settings\n"
-        "/help"
+    return "Crypto AI Bot is running."
 
+
+@app.route("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "bot": "running"
+    }
+
+
+def run_web():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
     )
 
-
-# ============================================================
-# Web Server - Render
-# ============================================================
-
-def run_web_server():
-
-    port = int(os.environ.get("PORT", 10000))
-
-    web_app = Flask(__name__)
-
-    @web_app.route("/")
-    def index():
-        return "AI Crypto Bot is running."
-
-    web_app.run(
+    app.run(
         host="0.0.0.0",
         port=port
     )
 
 
-# ============================================================
-# Main
-# ============================================================
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
-    app = ApplicationBuilder().token(
-        TELEGRAM_BOT_TOKEN
-    ).build()
+    logger.info(
+        "Starting Crypto AI Telegram Bot..."
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("signal", signal))
-    app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("sell", sell))
-    app.add_handler(CommandHandler("target", target))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("settings", settings))
-    app.add_handler(CommandHandler("help", help_command))
+    web_thread = threading.Thread(
+        target=run_web,
+        daemon=True
+    )
 
-    logger.info("AI Crypto Bot started successfully.")
+    web_thread.start()
 
-    app.run_polling(
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "price",
+            price_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "signal",
+            signal_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "buy",
+            buy_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "sell",
+            sell_command
+        )
+    )
+
+    logger.info(
+        "Telegram bot is running."
+    )
+
+    application.run_polling(
         drop_pending_updates=True
     )
 
 
 if __name__ == "__main__":
-
-    Thread(
-        target=run_web_server,
-        daemon=True
-    ).start()
-
     main()
