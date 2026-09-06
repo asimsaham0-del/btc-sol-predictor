@@ -64,7 +64,7 @@ def main():
         logger.error("خطأ: لم يتم ضبط TELEGRAM_BOT_TOKEN")
         return
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -79,7 +79,7 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
 
     logger.info("تم تشغيل البوت باستمرار (Polling Mode)...")
-        app.run_polling(poll_interval=3.0, drop_pending_updates=True)
+     app.run_polling(poll_interval=3.0, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
