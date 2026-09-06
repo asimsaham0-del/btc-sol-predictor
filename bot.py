@@ -79,7 +79,8 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
 
     logger.info("تم تشغيل البوت باستمرار (Polling Mode)...")
-    app.run_polling(drop_pending_updates=True)
+        app.run_polling(poll_interval=3.0, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
