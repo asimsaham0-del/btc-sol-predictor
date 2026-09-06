@@ -267,11 +267,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ **إعدادات التداول الحالية:**\n\n"
         f"• target Profit (هدف الربح): **{st.get('target_profit', 0)}%**\n"
         f"• Stop Loss (وقف الخسارة): **{st.get('stop_loss', 0)}%**\n"
-        f"• نمط التداول: **تجريبي فقط (Demo)**"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown") 
-def main():
-    def main():
+        f"• نمط التداول: **تجريبي فقط def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("خطأ: لم يتم ضبط TELEGRAM_BOT_TOKEN")
         return
@@ -293,6 +289,7 @@ def main():
 
     logger.info("تم تشغيل البوت باستمرار (Polling Mode)...")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
