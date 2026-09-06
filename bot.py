@@ -1,7 +1,7 @@
 import os
 import logging
 import threading
-import requests
+import ccxt
 from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update
@@ -12,6 +12,7 @@ from telegram.ext import (
 )
 import google.generativeai as genai
 
+# خادم الويب لإبقاء الخدمة نشطة على Render
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -35,62 +36,74 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# جلب السعر عبر مصدر عالمي موثوق وبدون قيود على خوادم Render
-def get_crypto_price(symbol="BTC"):
+# الاتصال بمنصة التداول باستخدام CCXT لجلب بيانات حقيقية وقوية
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+})
+
+def get_market_data(symbol_input):
     try:
-        # توحيد الرمز (مثال: تحويل BTCUSDT أو btc إلى كود عملة نظيف)
-        clean_symbol = symbol.upper().replace("USDT", "").replace("USD", "")
+        # تنسيق الرمز بالشكل الصحيح (مثال: BTC/USDT)
+        formatted_symbol = symbol_input.upper()
+        if "/" not in formatted_symbol:
+            if formatted_symbol.endswith("USDT"):
+                formatted_symbol = formatted_symbol[:-4] + "/USDT"
+            else:
+                formatted_symbol = formatted_symbol + "/USDT"
+
+        # جلب آخر شمعة والبيانات الحية
+        ticker = exchange.fetch_ticker(formatted_symbol)
+        ohlcv = exchange.fetch_ohlcv(formatted_symbol, timeframe='1h', limit=24) # آخر 24 ساعة
         
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={get_coingecko_id(clean_symbol)}&vs_currencies=usd&include_24hr_change=true"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        coin_id = get_coingecko_id(clean_symbol)
-        if coin_id in data:
-            price = float(data[coin_id]["usd"])
-            change = float(data[coin_id].get("usd_24h_change", 0.0))
-            return {
-                "symbol": clean_symbol + "USDT",
-                "price": price,
-                "change": change
-            }
-        return None
+        closes = [candle[4] for candle in ohlcv]
+        highs = [candle[2] for candle in ohlcv]
+        lows = [candle[3] for candle in ohlcv]
+
+        data = {
+            "symbol": formatted_symbol,
+            "price": ticker['last'],
+            "high_24h": max(highs),
+            "low_24h": min(lows),
+            "change_24h": ticker['percentage'],
+            "recent_closes": closes[-5:] # آخر 5 أسعار إغلاق للساعة الأخيرة
+        }
+        return data
     except Exception as e:
-        logger.error(f"خطأ في جلب السعر: {e}")
+        logger.error(f"خطأ في سحب بيانات السوق عبر CCXT: {e}")
         return None
 
-def get_coingecko_id(symbol):
-    mapping = {
-        "BTC": "bitcoin",
-        "ETH": "ethereum",
-        "SOL": "solana",
-        "BNB": "binancecoin",
-        "XRP": "ripple",
-        "ADA": "cardano"
-    }
-    return mapping.get(symbol, symbol.lower())
-
-def generate_analysis(data):
+def generate_strong_analysis(data):
     if not GEMINI_API_KEY:
         return "خطأ: مفتاح Gemini غير مضبوط."
     
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = (
-            f"تحليل فني سريع لعملة {data['symbol']}:\n"
-            f"- السعر الحالي: {data['price']} USD\n"
-            f"- التغير خلال 24 ساعة: {data['change']:.2f}%\n\n"
-            f"أعطني تحليلاً مختصراً جداً يوضح الاتجاه الحالي، مناطق الدعم، ونصيحة التداول."
+            f"أنت خبير محترف في التحليل الفني وأسواق العملات الرقمية.\n"
+            f"لديك البيانات الحقيقية التالية لعملة {data['symbol']} من منصة التداول:\n"
+            f"- السعر الحالي: {data['price']} USDT\n"
+            f"- أعلى سعر في 24 ساعة: {data['high_24h']} USDT\n"
+            f"- أدنى سعر في 24 ساعة: {data['low_24h']} USDT\n"
+            f"- نسبة التغير خلال 24 ساعة: {data['change_24h']}%\n"
+            f"- أسعار الإغلاق الأخيرة (آخر 5 ساعات): {data['recent_closes']}\n\n"
+            f"قدم تحليلاً فنياً احترافياً وقوياً يشمل:\n"
+            f"1. الاتجاه المسيطر (صاعد، هابط، أو جانبي).\n"
+            f"2. مستويات الدعم والمقاومة القريبة الحالية.\n"
+            f"3. توصية تداول دقيقة واضحة (دخول، هدف واضح، ووقف خسارة صارم)."
         )
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        logger.error(f"خطأ Gemini: {e}")
-        return "تعذر إكمال التحليل الفني."
+        logger.error(f"خطأ في توليد التحليل من Gemini: {e}")
+        return "تعذر إتمام التحليل الفني حالياً."
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً بك! البوت يعمل الآن بكفاءة عالية.\nجرب إرسال:\n/analyze BTC\nأو\n/analyze SOL"
+        "🚀 أهلاً بك في بوت التحليل الفني الاحترافي (مدعوم ببيانات السوق الحقيقية).\n\n"
+        "أمر الاستخدام:\n"
+        "/analyze BTC\n"
+        "/analyze SOL\n"
+        "/analyze ETH"
     )
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,21 +111,23 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         symbol = context.args[0].upper()
 
-    await update.message.reply_text(f"⏳ جاري جلب السعر وتحليل {symbol}...")
-    
-    market_data = get_crypto_price(symbol)
+    await update.message.reply_text(f"🔍 جاري الاتصال بمنصات التداول وسحب بيانات {symbol}...")
+
+    market_data = get_market_data(symbol)
     if not market_data:
-        await update.message.reply_text("عذراً، لم أتمكن من العثور على هذه العملة. جرب رموز مثل: BTC, ETH, SOL")
+        await update.message.reply_text("❌ تعذر جلب بيانات العملة. تأكد من كتابة الرمز بشكل صحيح (مثال: BTC, ETH, SOL).")
         return
 
-    analysis_result = generate_analysis(market_data)
-    
+    analysis = generate_strong_analysis(market_data)
+
     message = (
-        f"📊 تحليل {market_data['symbol']}\n\n"
-        f"💵 السعر: ${market_data['price']:,.2f}\n"
-        f"📈 التغير (24h): {market_data['change']:.2f}%\n\n"
-        f"--- رأي الذكاء الاصطناعي ---\n"
-        f"{analysis_result}"
+        f"📊 **تقرير التحليل الفني المتقدم: {market_data['symbol']}**\n\n"
+        f"💵 السعر الفعلي: `${market_data['price']:,.2f}`\n"
+        f"📈 التغير (24h): `{market_data['change_24h']:.2f}%`\n"
+        f"🔺 أعلى سعر (24h): `${market_data['high_24h']:,.2f}`\n"
+        f"🔻 أدنى سعر (24h): `${market_data['low_24h']:,.2f}`\n\n"
+        f"--- **رؤية الخبير الذكي** ---\n"
+        f"{analysis}"
     )
     await update.message.reply_text(message)
 
@@ -127,6 +142,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("analyze", analyze_command))
 
+    logger.info("البوت يعمل الآن بنظام سحب البيانات الحقيقي عبر CCXT...")
     app.run_polling(poll_interval=3.0, drop_pending_updates=True)
 
 if __name__ == "__main__":
